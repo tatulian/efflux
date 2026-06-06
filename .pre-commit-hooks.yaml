@@ -1,0 +1,14 @@
+- id: efflux
+  name: efflux
+  description: Check that functions declare the side effects they use
+  entry: efflux
+  language: python
+  types: [python]
+  pass_filenames: false
+  require_serial: true
+  # Point this at your package in your own .pre-commit-config.yaml:
+  #   - repo: https://github.com/tatulian/efflux
+  #     rev: v0.1.0
+  #     hooks:
+  #       - id: efflux
+  #         args: ["yourpackage"]
