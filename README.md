@@ -90,6 +90,7 @@ children**, so you choose how precise to be:
 IO                      — any interaction with the outside world
 ├── Network
 ├── ReadsEnv
+├── Process              — spawns external processes (subprocess, os.system)
 ├── Filesystem → ReadsFS, WritesFS
 └── Database   → ReadsDB, WritesDB
 Raises[E]               — parameterized by the exception class
@@ -135,10 +136,14 @@ treated as pure, and you can teach it about third-party functions:
 "time.time" = ["Clock"]
 ```
 
-efflux already ships a built-in map for common stdlib and HTTP calls (`open`,
-`os.getenv`, `logging.*`, `time.*`, `random.*`, `socket`, `requests`, `httpx`),
-applied by default — your entries override it per callee, and `--no-builtins`
-turns it off. Report every function's inferred effects instead of checking:
+efflux already ships a built-in map for common stdlib and popular third-party
+calls — filesystem (`open`, `pathlib`, `shutil`, `tempfile`, `os.path`),
+`subprocess`/`os.system`, networking (`socket`, `http.client`, `smtplib`,
+`requests`, `httpx`, `aiohttp`), `os.getenv`, `logging.*`, `time.*`/`datetime`,
+`random`/`uuid`/`secrets`, `asyncio.sleep`, and databases (`sqlalchemy`,
+`psycopg`, `redis`, `pymongo`) — applied by default; your entries override it
+per callee, and `--no-builtins` turns it off. Report every function's inferred
+effects instead of checking:
 
 ```bash
 efflux --report path/to/your/package      # human-readable
@@ -179,6 +184,19 @@ efflux mypkg --fix            # complete existing Effects[...] declarations
 efflux mypkg --fix --unsafe   # also wrap plain `-> T` return types (review the diff!)
 ```
 
+Go stricter with `--strict`. It models explicit `raise` statements as effects — so
+an exception that escapes a function without being declared is reported — and it
+warns about declared effects that nothing actually uses (e.g. a `Raises[ValueError]`
+you swallow in a `try/except`):
+
+```bash
+efflux mypkg --strict
+```
+
+Only explicit `raise` is modeled (not implicit raises like `KeyError` from `d[k]`),
+and the unused-declaration findings are advisory — they print as warnings but never
+change the exit code. Off by default to keep adoption gradual.
+
 ### Narrowing: contain effects on purpose
 
 A `try/except` discharges the matching `Raises`:
@@ -201,6 +219,40 @@ def warm_cache() -> Effects[int]:
     with allow(WritesDB):
         return _seed()                     # _seed writes to the DB on purpose
 ```
+
+### Effects across interfaces
+
+A method call is checked against the **static type at the call site** — the same type
+mypy sees. So put effects on the *interface*: that's the contract every caller goes
+through.
+
+```python
+from abc import ABC, abstractmethod
+from efflux import Effects, IO, WritesDB
+
+class Repo(ABC):
+    @abstractmethod
+    def get(self, id: int) -> Effects[Row, IO]: ...      # the contract: get() does IO
+
+class SqlRepo(Repo):
+    def get(self, id: int) -> Effects[Row, WritesDB]:    # narrower — IO covers WritesDB
+        return db.query(id)
+
+def handler(repo: Repo) -> Effects[Row]:                 # depends on the interface...
+    return repo.get(1)                                   # ...so efflux sees Repo.get's IO
+# error: "handler" has undeclared effect "IO" (from "Repo.get")  [undeclared-effect]
+```
+
+`handler` depends on `Repo`, so efflux uses `Repo.get`'s declared `IO` — declaring
+`Effects[Row]` (pure) is flagged. An implementation may declare a **subset** of the
+interface's effects (here `WritesDB`, which `IO` covers); callers through the interface
+still see the broader `IO`, and each method is checked against its own declaration. To
+mypy, `Effects[Row, IO]` and `Effects[Row, WritesDB]` both erase to `Row`, so the
+override stays type-compatible.
+
+The flip side: if an interface declares *fewer* effects than an implementation, the
+extra effects are hidden from callers that go through the interface — by design, the
+abstraction is the contract. Put what callers must know about on the interface.
 
 ## A worked example
 
@@ -234,12 +286,12 @@ def price_basket(basket: Basket) -> Effects[Money]:   # declares: no effects
 If someone later makes `apply_discounts` read feature flags from the database, efflux fails:
 
 ```text
-pricing.py:12: error: function "pricing.price_basket" has undeclared effect
-"ReadsDB" (introduced by call to "flags.is_enabled" at line 14)
+pricing.py:14: error: "price_basket" has undeclared effect "ReadsDB" (from "flags.is_enabled")  [undeclared-effect]
 ```
 
-The violation is caught at check time, with the exact call that broke the rule — not in a
-postmortem.
+mypy-style output — it points at the exact call that broke the rule (line 14), names the
+function without its module, and carries an error code. The violation is caught at check
+time, not in a postmortem.
 
 ## How it works
 
@@ -323,6 +375,7 @@ plugins = ["efflux.mypy_plugin"]
 | `ReadsEnv` | reads environment variables |
 | `Filesystem` / `ReadsFS` / `WritesFS` | filesystem access (read / write) |
 | `Database` / `ReadsDB` / `WritesDB` | database access (read / write) |
+| `Process` | spawns an external process (subprocess, shell) |
 | `Raises[E]` | can raise exception class `E` |
 | `Logs` | emits log output |
 | `Emits` | emits events / messages |
@@ -342,6 +395,13 @@ runtime it's metadata, and `import efflux` does not import mypy.
 
 **Is it all-or-nothing?** No — adoption is gradual. Only functions you annotate with
 `Effects[...]` are enforced; the rest are inferred and propagated silently.
+
+**Does it track raised exceptions?** `Raises[E]` propagates as a declared contract across
+the call graph, with exception-subclass subsumption (`Raises[OSError]` covers
+`Raises[ConnectionError]`). By default a literal `raise` is *not* itself a source of
+effects; pass `--strict` to model explicit `raise` statements — then an exception that
+escapes a function without being declared is flagged. `--strict` also warns about declared
+effects nothing actually uses.
 
 **Which versions?** Python ≥ 3.10. The checker drives mypy internals and is exercised
 against mypy 2.x (`mypy>=2.1,<3`).

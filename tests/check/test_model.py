@@ -17,8 +17,7 @@ def test_diagnostic_message_format():
     m = FunctionModel(fullname="m.f", file="m.py", line=1, declared=frozenset())
     d = Diagnostic(function=m, effect=EffectRef("efflux.effects.WritesDB"), call=CallSite("m.g", 3))
     assert d.format() == (
-        'm.py:1: error: function "m.f" has undeclared effect "WritesDB" '
-        '(introduced by call to "m.g" at line 3)'
+        'm.py:3: error: "f" has undeclared effect "WritesDB" (from "m.g")  [undeclared-effect]'
     )
 
 
@@ -45,6 +44,20 @@ def test_effectref_is_hashable_and_eq():
     assert {a, b} == {a}
 
 
+def test_diagnostic_format_for_raise_provenance():
+    from efflux.check.model import RaiseSite
+
+    m = FunctionModel(fullname="m.c", file="m.py", line=1, declared=frozenset())
+    d = Diagnostic(
+        function=m,
+        effect=EffectRef("efflux.effects.Raises", "builtins.ValueError"),
+        call=RaiseSite(EffectRef("efflux.effects.Raises", "builtins.ValueError"), 4),
+    )
+    assert d.format() == (
+        'm.py:4: error: "c" has undeclared effect "Raises[ValueError]"  [undeclared-effect]'
+    )
+
+
 def test_diagnostic_format_uses_effectref_short():
     m = FunctionModel(fullname="m.f", file="m.py", line=1, declared=frozenset())
     d = Diagnostic(
@@ -53,8 +66,8 @@ def test_diagnostic_format_uses_effectref_short():
         call=CallSite("m.g", 3),
     )
     assert d.format() == (
-        'm.py:1: error: function "m.f" has undeclared effect "Raises[ValueError]" '
-        '(introduced by call to "m.g" at line 3)'
+        'm.py:3: error: "f" has undeclared effect "Raises[ValueError]" (from "m.g")  '
+        "[undeclared-effect]"
     )
 
 
@@ -75,6 +88,41 @@ def test_callsite_carries_discharge_context():
     assert c.allowed == frozenset({"efflux.effects.WritesDB"})
 
 
+def test_raise_site_defaults():
+    from efflux.check.model import RaiseSite
+
+    r = RaiseSite(effect=EffectRef("efflux.effects.Raises", "builtins.ValueError"), line=5)
+    assert r.effect == EffectRef("efflux.effects.Raises", "builtins.ValueError")
+    assert r.line == 5
+    assert r.caught == frozenset()
+    assert r.allowed == frozenset()
+
+
+def test_function_model_raises_defaults_empty():
+    m = FunctionModel("m.f", "m.py", 1, declared=None)
+    assert m.raises == []
+
+
+def test_unused_declaration_format_tag():
+    from efflux.check.model import UnusedDeclaration
+
+    m = FunctionModel(fullname="m.b", file="m.py", line=4, declared=frozenset())
+    u = UnusedDeclaration(function=m, effect=EffectRef("efflux.effects.WritesDB"))
+    assert u.format() == ('m.py:4: warning: "b" declares unused effect "WritesDB"  [unused-effect]')
+
+
+def test_unused_declaration_format_raises():
+    from efflux.check.model import UnusedDeclaration
+
+    m = FunctionModel(fullname="m.b", file="m.py", line=4, declared=frozenset())
+    u = UnusedDeclaration(
+        function=m, effect=EffectRef("efflux.effects.Raises", "builtins.ValueError")
+    )
+    assert u.format() == (
+        'm.py:4: warning: "b" declares unused effect "Raises[ValueError]"  [unused-effect]'
+    )
+
+
 def test_boundary_violation_format():
     from efflux.check.model import BoundaryViolation
 
@@ -86,7 +134,8 @@ def test_boundary_violation_format():
         call=CallSite("requests.api.get", 5),
     )
     msg = v.format()
-    assert "app/domain.py:3:" in msg
+    assert "app/domain.py:5:" in msg  # points at the call line, not the def line
     assert 'breaks boundary "app.domain.*"' in msg
     assert 'forbidden effect "Network"' in msg
     assert "requests.api.get" in msg
+    assert '"f"' in msg and '"app.domain.f"' not in msg  # short name, no module

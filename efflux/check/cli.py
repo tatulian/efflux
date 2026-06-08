@@ -16,7 +16,7 @@ from efflux.check.baseline import filter_diagnostics, load_keys, write_baseline
 from efflux.check.default_externals import DEFAULT_EXTERNAL_MAP
 from efflux.check.engine import analyze
 from efflux.check.external_map import load_boundaries, load_external_map
-from efflux.check.inference import check, check_boundaries, infer
+from efflux.check.inference import check, check_boundaries, check_unused, infer
 from efflux.check.model import EffectRef, FunctionModel
 
 
@@ -55,6 +55,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --fix, also wrap plain `-> T` annotations (more invasive)",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="model explicit `raise` statements as effects and warn on unused declarations",
+    )
     return parser
 
 
@@ -75,8 +80,9 @@ def _run_report(
     exc_ancestors: dict[str, frozenset[str]],
     *,
     as_json: bool,
+    strict: bool,
 ) -> int:
-    inferred = infer(functions, external, ancestors, exc_ancestors)
+    inferred = infer(functions, external, ancestors, exc_ancestors, include_raises=strict)
     rows = sorted(functions.values(), key=lambda m: (m.file, m.line))
     if as_json:
         payload = {
@@ -108,9 +114,14 @@ def _run_check(
     baseline: str | None,
     update: bool,
     as_json: bool,
+    strict: bool,
 ) -> int:
     diagnostics = check(
-        functions, ancestors=ancestors, exc_ancestors=exc_ancestors, external=external
+        functions,
+        ancestors=ancestors,
+        exc_ancestors=exc_ancestors,
+        external=external,
+        include_raises=strict,
     )
     if update and baseline is not None:
         write_baseline(baseline, diagnostics)
@@ -119,7 +130,12 @@ def _run_check(
     if baseline is not None:
         diagnostics = filter_diagnostics(diagnostics, load_keys(baseline))
     boundary_violations = check_boundaries(
-        functions, ancestors, exc_ancestors, external, boundaries
+        functions, ancestors, exc_ancestors, external, boundaries, include_raises=strict
+    )
+    unused = (
+        check_unused(functions, ancestors, exc_ancestors, external, include_raises=True)
+        if strict
+        else []
     )
     diag_sorted = sorted(
         diagnostics, key=lambda d: (d.function.file, d.function.line, d.effect.short)
@@ -128,9 +144,10 @@ def _run_check(
         boundary_violations,
         key=lambda b: (b.function.file, b.function.line, b.boundary, b.effect.short),
     )
-    ok = not diag_sorted and not bound_sorted
+    unused_sorted = sorted(unused, key=lambda u: (u.function.file, u.function.line, u.effect.short))
+    ok = not diag_sorted and not bound_sorted  # advisory warnings never flip the exit code
     if as_json:
-        payload = {
+        payload: dict[str, object] = {
             "ok": ok,
             "violations": [
                 {
@@ -138,7 +155,7 @@ def _run_check(
                     "file": d.function.file,
                     "line": d.function.line,
                     "effect": d.effect.short,
-                    "callee": d.call.callee,
+                    "callee": getattr(d.call, "callee", None),
                     "call_line": d.call.line,
                 }
                 for d in diag_sorted
@@ -150,22 +167,34 @@ def _run_check(
                     "line": b.function.line,
                     "boundary": b.boundary,
                     "effect": b.effect.short,
-                    "callee": b.call.callee,
+                    "callee": getattr(b.call, "callee", None),
                     "call_line": b.call.line,
                 }
                 for b in bound_sorted
             ],
         }
+        if strict:
+            payload["unused"] = [
+                {
+                    "function": u.function.fullname,
+                    "file": u.function.file,
+                    "line": u.function.line,
+                    "effect": u.effect.short,
+                }
+                for u in unused_sorted
+            ]
         print(json.dumps(payload, indent=2))
         return 0 if ok else 1
-    if ok:
+    if ok and not unused_sorted:
         print("no effect violations found")
         return 0
     for diag in diag_sorted:
         print(diag.format())
     for violation in bound_sorted:
         print(violation.format())
-    return 1
+    for declaration in unused_sorted:
+        print(declaration.format())
+    return 0 if ok else 1
 
 
 def _run_fix(
@@ -225,7 +254,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.report:
-        return _run_report(functions, external, ancestors, exc_ancestors, as_json=args.json)
+        return _run_report(
+            functions, external, ancestors, exc_ancestors, as_json=args.json, strict=args.strict
+        )
     return _run_check(
         functions,
         external,
@@ -235,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
         baseline=args.baseline,
         update=args.update,
         as_json=args.json,
+        strict=args.strict,
     )
 
 

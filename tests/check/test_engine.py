@@ -359,6 +359,73 @@ def test_collect_calls_allow_comment(tmp_path):
     assert leaf_calls and leaf_calls[0].allowed == frozenset({"efflux.effects.WritesDB"})
 
 
+def test_walker_captures_raise(tmp_path):
+    (tmp_path / "m.py").write_text("def f() -> int:\n    raise ValueError()\n")
+    functions, _a, exc = analyze([str(tmp_path / "m.py")])
+    raises = functions["m.f"].raises
+    assert [r.effect for r in raises] == [EffectRef("efflux.effects.Raises", "builtins.ValueError")]
+    assert "builtins.ValueError" in exc
+
+
+def test_walker_raise_without_parens(tmp_path):
+    (tmp_path / "m.py").write_text("def f() -> int:\n    raise ValueError\n")
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    assert [r.effect for r in functions["m.f"].raises] == [
+        EffectRef("efflux.effects.Raises", "builtins.ValueError")
+    ]
+
+
+def test_walker_self_caught_raise_is_marked_caught(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "def f() -> int:\n"
+        "    try:\n"
+        "        raise ValueError()\n"
+        "    except ValueError:\n"
+        "        return 0\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    r = functions["m.f"].raises
+    assert r and r[0].caught == frozenset({"builtins.ValueError"})
+
+
+def test_walker_bare_reraise_in_handler(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "def f() -> int:\n    try:\n        return 0\n    except ValueError:\n        raise\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    r = functions["m.f"].raises
+    # bare raise re-raises ValueError; the handler body is not covered by its own try
+    assert [x.effect for x in r] == [EffectRef("efflux.effects.Raises", "builtins.ValueError")]
+    assert r[0].caught == frozenset()
+
+
+def test_walker_raise_user_exception_populates_exc_ancestors(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "class MyErr(Exception): ...\ndef f() -> int:\n    raise MyErr()\n"
+    )
+    functions, _a, exc = analyze([str(tmp_path / "m.py")])
+    assert [x.effect for x in functions["m.f"].raises] == [
+        EffectRef("efflux.effects.Raises", "m.MyErr")
+    ]
+    assert "builtins.Exception" in exc["m.MyErr"]
+
+
+def test_analyze_strict_reports_escaping_raise(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from efflux import Effects\ndef f() -> Effects[int]:\n    raise ValueError()\n"
+    )
+    functions, ancestors, exc = analyze([str(tmp_path / "m.py")])
+    # default: raises not modeled -> clean
+    assert check(functions, ancestors=ancestors, exc_ancestors=exc, external={}) == []
+    # strict: undeclared escaping raise is reported
+    diags = check(
+        functions, ancestors=ancestors, exc_ancestors=exc, external={}, include_raises=True
+    )
+    assert len(diags) == 1
+    assert diags[0].effect == EffectRef("efflux.effects.Raises", "builtins.ValueError")
+    assert diags[0].function.fullname == "m.f"
+
+
 def test_collect_calls_else_body_not_caught(tmp_path):
     # An exception raised in a try...else clause is NOT routed through the try's
     # except handlers, so a call there must NOT inherit the try's caught set.

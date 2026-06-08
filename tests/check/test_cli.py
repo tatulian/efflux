@@ -250,7 +250,8 @@ def test_cli_reports_undeclared_effect_across_module(tmp_path):
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert 'has undeclared effect "WritesDB"' in proc.stdout
-    assert 'function "svc.charge"' in proc.stdout
+    assert '"charge" has undeclared effect' in proc.stdout  # short name, no module prefix
+    assert "svc.charge" not in proc.stdout
 
 
 def test_cli_passes_when_effect_declared(tmp_path):
@@ -294,7 +295,7 @@ def test_cli_within_module_violation(tmp_path):
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert 'has undeclared effect "WritesDB"' in proc.stdout
-    assert 'function "m.caller"' in proc.stdout
+    assert '"caller" has undeclared effect' in proc.stdout
 
 
 def test_cli_handles_empty_directory_gracefully(tmp_path):
@@ -510,6 +511,65 @@ def test_cli_allow_context_manager_discharges(tmp_path):
         text=True,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+_STRICT_CASE1 = (
+    "from efflux import Effects, Raises\n"
+    "def a() -> Effects[None, Raises[ValueError]]:\n"
+    "    raise ValueError()\n"
+    "def b() -> Effects[None, Raises[ValueError]]:\n"  # declares it, but swallows it
+    "    try:\n"
+    "        return a()\n"
+    "    except ValueError:\n"
+    "        pass\n"
+)
+
+
+def test_cli_strict_warns_unused_declaration(tmp_path):
+    (tmp_path / "c1.py").write_text(_STRICT_CASE1)
+    proc = _cli("--strict", str(tmp_path / "c1.py"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr  # advisory only
+    assert '"b" declares unused effect "Raises[ValueError]"' in proc.stdout
+    assert "warning:" in proc.stdout
+    assert "[unused-effect]" in proc.stdout
+    # a actually raises ValueError -> its declaration is justified, not flagged
+    assert "c1.a" not in proc.stdout
+
+
+def test_cli_strict_unused_is_silent_without_flag(tmp_path):
+    (tmp_path / "c1.py").write_text(_STRICT_CASE1)
+    proc = _cli(str(tmp_path / "c1.py"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "no effect violations found" in proc.stdout
+    assert "unused" not in proc.stdout
+
+
+def test_cli_strict_reports_escaping_reraise(tmp_path):
+    (tmp_path / "c2.py").write_text(
+        "from efflux import Effects, Raises\n"
+        "def a() -> Effects[None, Raises[ValueError]]:\n"
+        "    raise ValueError()\n"
+        "def c() -> Effects[None]:\n"
+        "    try:\n"
+        "        return a()\n"
+        "    except ValueError:\n"
+        "        raise\n"  # re-raise escapes
+    )
+    proc = _cli("--strict", str(tmp_path / "c2.py"))
+    assert proc.returncode == 1, proc.stdout + proc.stderr  # a real violation
+    assert '"c" has undeclared effect "Raises[ValueError]"' in proc.stdout
+    assert "c2.py:8: error:" in proc.stdout  # points at the re-raise line, not the def line
+
+
+def test_cli_strict_json_carries_unused(tmp_path):
+    (tmp_path / "c1.py").write_text(_STRICT_CASE1)
+    proc = _cli("--strict", "--json", str(tmp_path / "c1.py"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["ok"] is True  # unused warnings do not flip ok
+    assert any(
+        u["effect"] == "Raises[ValueError]" and u["function"] == "c1.b" for u in data["unused"]
+    )
 
 
 def test_cli_allow_comment_discharges(tmp_path):

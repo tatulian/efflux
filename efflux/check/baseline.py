@@ -9,7 +9,7 @@ Key = tuple[str, str, str | None]
 
 
 def diagnostic_key(d: Diagnostic) -> Key:
-    return (d.function.fullname, d.effect.short, d.call.callee)
+    return (d.function.fullname, d.effect.short, getattr(d.call, "callee", None))
 
 
 def write_baseline(path: str, diagnostics: list[Diagnostic]) -> None:
@@ -18,7 +18,7 @@ def write_baseline(path: str, diagnostics: list[Diagnostic]) -> None:
             {
                 "function": d.function.fullname,
                 "effect": d.effect.short,
-                "callee": d.call.callee,
+                "callee": getattr(d.call, "callee", None),
             }
             for d in diagnostics
         ),

@@ -31,6 +31,10 @@ class Network(IO): ...
 class ReadsEnv(IO): ...
 
 
+class Process(IO):
+    """Spawns or replaces an external process (subprocess, os.system, os.popen)."""
+
+
 class ReadsFS(Filesystem): ...
 
 

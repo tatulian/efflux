@@ -324,3 +324,201 @@ def test_infer_allow_discharges_tag_via_subsumption():
     anc = {W: frozenset({W, "efflux.effects.Database", "efflux.effects.IO"})}
     inferred = infer(_fns(leaf, f), external={}, ancestors=anc, exc_ancestors={})
     assert inferred["m.f"] == frozenset()
+
+
+def test_check_unused_reports_dead_declaration():
+    from efflux.check.inference import check_unused
+
+    R = "efflux.effects.Raises"
+    # b declares Raises[ValueError] but has no calls -> inferred empty -> unused.
+    b = FunctionModel("m.b", "m.py", 4, declared=frozenset({EffectRef(R, "builtins.ValueError")}))
+    unused = check_unused(_fns(b), ancestors={}, exc_ancestors={}, external={})
+    assert len(unused) == 1
+    assert unused[0].function.fullname == "m.b"
+    assert unused[0].effect == EffectRef(R, "builtins.ValueError")
+
+
+def test_check_unused_skips_used_and_subsumed_declarations():
+    from efflux.check.inference import check_unused
+
+    W = "efflux.effects.WritesDB"
+    IO = "efflux.effects.IO"
+    # f declares IO and uses WritesDB (from an external call) -> IO covers it -> NOT unused.
+    f = FunctionModel(
+        "m.f", "m.py", 3, declared=frozenset({EffectRef(IO)}), calls=[CallSite("db.write", 4)]
+    )
+    unused = check_unused(
+        _fns(f),
+        ancestors={W: frozenset({W, IO})},
+        exc_ancestors={},
+        external={"db.write": frozenset({EffectRef(W)})},
+    )
+    assert unused == []
+
+
+def test_check_unused_flags_only_the_dead_one_of_several():
+    from efflux.check.inference import check_unused
+
+    W = "efflux.effects.WritesDB"
+    Rd = "efflux.effects.ReadsDB"
+    # f declares ReadsDB + WritesDB but only WritesDB flows in -> ReadsDB is dead.
+    f = FunctionModel(
+        "m.f",
+        "m.py",
+        3,
+        declared=frozenset({EffectRef(Rd), EffectRef(W)}),
+        calls=[CallSite("db.write", 4)],
+    )
+    anc = {W: frozenset({W}), Rd: frozenset({Rd})}
+    unused = check_unused(
+        _fns(f), ancestors=anc, exc_ancestors={}, external={"db.write": frozenset({EffectRef(W)})}
+    )
+    assert [u.effect for u in unused] == [EffectRef(Rd)]
+
+
+def test_check_unused_broad_raises_covering_narrow_is_not_flagged():
+    from efflux.check.inference import check_unused
+    from efflux.check.model import RaiseSite
+
+    R = "efflux.effects.Raises"
+    # f declares Raises[Exception] and actually raises ValueError -> covered -> NOT unused.
+    f = FunctionModel(
+        "m.f",
+        "m.py",
+        3,
+        declared=frozenset({EffectRef(R, "builtins.Exception")}),
+        raises=[RaiseSite(EffectRef(R, "builtins.ValueError"), 4)],
+    )
+    exc_anc = {
+        "builtins.ValueError": frozenset(
+            {"builtins.ValueError", "builtins.Exception", "builtins.BaseException"}
+        )
+    }
+    unused = check_unused(
+        _fns(f), ancestors={}, exc_ancestors=exc_anc, external={}, include_raises=True
+    )
+    assert unused == []
+
+
+def test_check_unused_ignores_functions_without_declaration():
+    from efflux.check.inference import check_unused
+
+    # declared is None -> inferred-and-propagated, never reported (gradual).
+    f = FunctionModel("m.f", "m.py", 1, declared=None, calls=[])
+    unused = check_unused(_fns(f), ancestors={}, exc_ancestors={}, external={})
+    assert unused == []
+
+
+def test_infer_include_raises_folds_and_propagates():
+    from efflux.check.model import RaiseSite
+
+    R = "efflux.effects.Raises"
+    leaf = FunctionModel(
+        "m.leaf",
+        "m.py",
+        1,
+        declared=None,
+        raises=[RaiseSite(EffectRef(R, "builtins.ValueError"), 2)],
+    )
+    caller = FunctionModel("m.caller", "m.py", 4, declared=None, calls=[CallSite("m.leaf", 5)])
+    fns = _fns(leaf, caller)
+    # default: raises ignored -> both pure
+    base = infer(fns, external={}, ancestors={}, exc_ancestors={})
+    assert base["m.leaf"] == frozenset()
+    assert base["m.caller"] == frozenset()
+    # include_raises: leaf's raise is folded in and propagates to caller
+    inf = infer(fns, external={}, ancestors={}, exc_ancestors={}, include_raises=True)
+    assert inf["m.leaf"] == frozenset({EffectRef(R, "builtins.ValueError")})
+    assert inf["m.caller"] == frozenset({EffectRef(R, "builtins.ValueError")})
+
+
+def test_infer_include_raises_self_caught_is_discharged():
+    from efflux.check.model import RaiseSite
+
+    R = "efflux.effects.Raises"
+    # raise ValueError() inside try/except ValueError -> caught on the raise site -> discharged
+    f = FunctionModel(
+        "m.f",
+        "m.py",
+        1,
+        declared=None,
+        raises=[
+            RaiseSite(
+                EffectRef(R, "builtins.ValueError"), 3, caught=frozenset({"builtins.ValueError"})
+            )
+        ],
+    )
+    exc_anc = {
+        "builtins.ValueError": frozenset(
+            {"builtins.ValueError", "builtins.Exception", "builtins.BaseException"}
+        )
+    }
+    inf = infer(_fns(f), external={}, ancestors={}, exc_ancestors=exc_anc, include_raises=True)
+    assert inf["m.f"] == frozenset()
+
+
+def test_check_include_raises_reports_undeclared_escaping_raise():
+    from efflux.check.model import RaiseSite
+
+    R = "efflux.effects.Raises"
+    # c declares no effects but raises ValueError (uncaught on the raise site) -> reported.
+    c = FunctionModel(
+        "m.c",
+        "m.py",
+        1,
+        declared=frozenset(),
+        raises=[RaiseSite(EffectRef(R, "builtins.ValueError"), 4)],
+    )
+    diags = check(_fns(c), ancestors={}, exc_ancestors={}, external={}, include_raises=True)
+    assert len(diags) == 1
+    assert diags[0].effect == EffectRef(R, "builtins.ValueError")
+    assert diags[0].function.fullname == "m.c"
+    assert diags[0].call.line == 4  # provenance points at the raise
+
+
+def test_check_without_include_raises_ignores_raises():
+    from efflux.check.model import RaiseSite
+
+    R = "efflux.effects.Raises"
+    c = FunctionModel(
+        "m.c",
+        "m.py",
+        1,
+        declared=frozenset(),
+        raises=[RaiseSite(EffectRef(R, "builtins.ValueError"), 4)],
+    )
+    assert check(_fns(c), ancestors={}, exc_ancestors={}, external={}) == []
+
+
+def test_check_unused_flags_dead_raises_but_not_the_justified_one():
+    from efflux.check.inference import check_unused
+    from efflux.check.model import RaiseSite
+
+    R = "efflux.effects.Raises"
+    # a actually raises ValueError -> its declaration is justified.
+    a = FunctionModel(
+        "m.a",
+        "m.py",
+        1,
+        declared=frozenset({EffectRef(R, "builtins.ValueError")}),
+        raises=[RaiseSite(EffectRef(R, "builtins.ValueError"), 2)],
+    )
+    # b calls a inside try/except ValueError and swallows it -> b raises nothing -> dead decl.
+    b = FunctionModel(
+        "m.b",
+        "m.py",
+        4,
+        declared=frozenset({EffectRef(R, "builtins.ValueError")}),
+        calls=[CallSite("m.a", 5, caught=frozenset({"builtins.ValueError"}))],
+    )
+    exc_anc = {
+        "builtins.ValueError": frozenset(
+            {"builtins.ValueError", "builtins.Exception", "builtins.BaseException"}
+        )
+    }
+    unused = check_unused(
+        _fns(a, b), ancestors={}, exc_ancestors=exc_anc, external={}, include_raises=True
+    )
+    assert [(u.function.fullname, u.effect) for u in unused] == [
+        ("m.b", EffectRef(R, "builtins.ValueError"))
+    ]

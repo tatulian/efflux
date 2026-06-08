@@ -32,37 +32,63 @@ class EffectRef:
         return f"{name}[{self.arg.rsplit('.', 1)[-1]}]"
 
 
+@dataclass(frozen=True)
+class RaiseSite:
+    """An explicit `raise` in a function body. `effect` is the `Raises[E]` it
+    introduces; `caught`/`allowed` mirror CallSite for region-scoped discharge
+    (a raise inside a try whose except catches it, or under `efflux.allow`)."""
+
+    effect: EffectRef
+    line: int
+    caught: frozenset[str] = field(default_factory=frozenset)
+    allowed: frozenset[str] = field(default_factory=frozenset)
+
+
 @dataclass
 class FunctionModel:
     """A function extracted from the program.
 
     `declared` is the set of declared effect fullnames (from `Effects[...]`),
     or None if the function has no effect declaration (then it is inferred and
-    propagated but never itself reported)."""
+    propagated but never itself reported). `raises` holds explicit `raise`
+    statements (only consulted in --strict / `include_raises` mode)."""
 
     fullname: str
     file: str
     line: int
     declared: frozenset[EffectRef] | None
     calls: list[CallSite] = field(default_factory=list)
+    raises: list[RaiseSite] = field(default_factory=list)
+    name: str = ""  # module-stripped display name (e.g. "Repo.save"); set by the engine
+
+    @property
+    def display_name(self) -> str:
+        """Short name for messages — no module prefix (the file is already shown)."""
+        return self.name or self.fullname.rsplit(".", 1)[-1]
+
+
+def _source_suffix(call: CallSite | RaiseSite) -> str:
+    """`(from "<callee>")` for a resolved call; empty for a raise or unresolved call
+    (the diagnostic's line already points at the raise / the call)."""
+    if isinstance(call, CallSite) and call.callee:
+        return f' (from "{call.callee}")'
+    return ""
 
 
 @dataclass(frozen=True)
 class Diagnostic:
-    """A single violation: `function` uses `effect` (via call site `call`)
-    without declaring it."""
+    """A single violation: `function` uses `effect` (via a call or a raise)
+    without declaring it. Reported at the introducing call/raise line."""
 
     function: FunctionModel
     effect: EffectRef
-    call: CallSite
+    call: CallSite | RaiseSite
 
     def format(self) -> str:
-        callee = self.call.callee or "<unresolved call>"
         return (
-            f"{self.function.file}:{self.function.line}: error: "
-            f'function "{self.function.fullname}" has undeclared effect '
-            f'"{self.effect.short}" (introduced by call to "{callee}" '
-            f"at line {self.call.line})"
+            f"{self.function.file}:{self.call.line}: error: "
+            f'"{self.function.display_name}" has undeclared effect "{self.effect.short}"'
+            f"{_source_suffix(self.call)}  [undeclared-effect]"
         )
 
 
@@ -74,13 +100,28 @@ class BoundaryViolation:
     function: FunctionModel
     boundary: str
     effect: EffectRef
-    call: CallSite
+    call: CallSite | RaiseSite
 
     def format(self) -> str:
-        callee = self.call.callee or "<unresolved call>"
         return (
-            f"{self.function.file}:{self.function.line}: error: "
-            f'function "{self.function.fullname}" breaks boundary "{self.boundary}": '
-            f'forbidden effect "{self.effect.short}" (introduced by call to "{callee}" '
-            f"at line {self.call.line})"
+            f"{self.function.file}:{self.call.line}: error: "
+            f'"{self.function.display_name}" breaks boundary "{self.boundary}": '
+            f'forbidden effect "{self.effect.short}"{_source_suffix(self.call)}  [boundary]'
+        )
+
+
+@dataclass(frozen=True)
+class UnusedDeclaration:
+    """`function` declares `effect` in its `Effects[...]` but no call introduces it
+    (it covers none of the function's inferred effects). Advisory only; reported at
+    the declaration (the function's def line)."""
+
+    function: FunctionModel
+    effect: EffectRef
+
+    def format(self) -> str:
+        return (
+            f"{self.function.file}:{self.function.line}: warning: "
+            f'"{self.function.display_name}" declares unused effect "{self.effect.short}"'
+            f"  [unused-effect]"
         )

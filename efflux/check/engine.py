@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 from mypy import build
 from mypy.find_sources import create_source_list
@@ -16,6 +17,7 @@ from mypy.nodes import (
     MypyFile,
     Node,
     OverloadedFuncDef,
+    RaiseStmt,
     RefExpr,
     Statement,
     TryStmt,
@@ -26,7 +28,7 @@ from mypy.nodes import (
 from mypy.options import Options
 from mypy.types import Instance, Type, UnboundType
 
-from efflux.check.model import CallSite, EffectRef, FunctionModel
+from efflux.check.model import CallSite, EffectRef, FunctionModel, RaiseSite
 
 
 def _make_options() -> Options:
@@ -332,53 +334,130 @@ def _comment_allows(path: str, module: MypyFile) -> dict[int, frozenset[str]]:
     return out
 
 
-def _collect_calls(
+def _exc_ancestors_of(info: TypeInfo) -> frozenset[str]:
+    """Exception MRO fullnames (excluding object) for a raised/caught exception."""
+    return frozenset(b.fullname for b in info.mro if b.fullname != "builtins.object")
+
+
+def _raised_typeinfo(expr: Expression, types: dict[Expression, Type]) -> TypeInfo | None:
+    """Resolve the exception class of a ``raise <expr>`` to its TypeInfo. Handles
+    ``raise Exc()``, ``raise Exc``, ``raise instance``, and ``raise factory()``."""
+    if isinstance(expr, CallExpr):
+        callee = expr.callee
+        if isinstance(callee, RefExpr) and isinstance(callee.node, TypeInfo):
+            return callee.node  # raise Exc(...)
+        value = types.get(expr)  # raise factory() -> use the return type
+        return value.type if isinstance(value, Instance) else None
+    if isinstance(expr, RefExpr) and isinstance(expr.node, TypeInfo):
+        return expr.node  # raise Exc
+    value = types.get(expr)  # raise some_instance
+    return value.type if isinstance(value, Instance) else None
+
+
+def _handler_caught(
+    type_expr: Expression | None, exc_ancestors: dict[str, frozenset[str]]
+) -> frozenset[str]:
+    """Exception fullnames an ``except`` clause catches; also records their MRO in
+    ``exc_ancestors`` (needed when a bare ``raise`` re-raises one of them)."""
+    if type_expr is None:
+        return frozenset({"builtins.BaseException"})  # bare `except:`
+    refs = type_expr.items if isinstance(type_expr, TupleExpr) else [type_expr]
+    out: set[str] = set()
+    for ref in refs:
+        if isinstance(ref, RefExpr) and ref.fullname:
+            out.add(ref.fullname)
+            if isinstance(ref.node, TypeInfo):
+                exc_ancestors.setdefault(ref.fullname, _exc_ancestors_of(ref.node))
+    return frozenset(out)
+
+
+@dataclass
+class _Collector:
+    """Sinks + invariants for the body walk; region context is passed positionally."""
+
+    types: dict[Expression, Type]
+    comment_allows: dict[int, frozenset[str]]
+    exc_ancestors: dict[str, frozenset[str]]
+    calls: list[CallSite]
+    raises: list[RaiseSite]
+
+
+def _collect(
     func: FuncDef,
     types: dict[Expression, Type],
     comment_allows: dict[int, frozenset[str]],
-) -> list[CallSite]:
-    """Collect call sites within a function body, region-aware. Does NOT descend
-    into nested functions/lambdas (pruned)."""
-    calls: list[CallSite] = []
-    _walk_calls(func.body, types, frozenset(), frozenset(), calls, comment_allows)
-    calls.sort(key=lambda c: c.line)
-    return calls
+    exc_ancestors: dict[str, frozenset[str]],
+) -> tuple[list[CallSite], list[RaiseSite]]:
+    """Collect call sites and explicit raises within a function body, region-aware.
+    Does NOT descend into nested functions (pruned); lambdas are walked inline."""
+    c = _Collector(types, comment_allows, exc_ancestors, [], [])
+    _walk(func.body, c, frozenset(), frozenset(), frozenset())
+    c.calls.sort(key=lambda x: x.line)
+    c.raises.sort(key=lambda x: x.line)
+    return c.calls, c.raises
 
 
-def _walk_calls(
-    node: Node,
-    types: dict[Expression, Type],
+def _record_raise(
+    node: RaiseStmt,
+    c: _Collector,
     caught: frozenset[str],
     allowed: frozenset[str],
-    calls: list[CallSite],
-    comment_allows: dict[int, frozenset[str]],
+    handler_excs: frozenset[str],
+) -> None:
+    line_allowed = allowed | c.comment_allows.get(node.line, frozenset())
+    if node.expr is None:  # bare `raise` -> re-raise the enclosing handler's exception(s)
+        for fullname in handler_excs:
+            c.raises.append(
+                RaiseSite(EffectRef(RAISES_FULLNAME, fullname), node.line, caught, line_allowed)
+            )
+        return
+    info = _raised_typeinfo(node.expr, c.types)
+    if info is None or not info.has_base("builtins.BaseException"):
+        return
+    c.exc_ancestors.setdefault(info.fullname, _exc_ancestors_of(info))
+    c.raises.append(
+        RaiseSite(EffectRef(RAISES_FULLNAME, info.fullname), node.line, caught, line_allowed)
+    )
+
+
+def _walk(
+    node: Node,
+    c: _Collector,
+    caught: frozenset[str],
+    allowed: frozenset[str],
+    handler_excs: frozenset[str],
 ) -> None:
     if isinstance(node, FuncDef):
         return  # nested function is its own model; lambdas are walked inline
+    if isinstance(node, RaiseStmt):
+        _record_raise(node, c, caught, allowed, handler_excs)
+        for child in _iter_children(node):  # still descend for calls inside the raise expr
+            _walk(child, c, caught, allowed, handler_excs)
+        return
     if isinstance(node, CallExpr):
-        line_allowed = allowed | comment_allows.get(node.line, frozenset())
-        calls.append(
-            CallSite(_callee_fullname(node.callee, types), node.line, caught, line_allowed)
+        line_allowed = allowed | c.comment_allows.get(node.line, frozenset())
+        c.calls.append(
+            CallSite(_callee_fullname(node.callee, c.types), node.line, caught, line_allowed)
         )
         for child in _iter_children(node):
-            _walk_calls(child, types, caught, allowed, calls, comment_allows)
+            _walk(child, c, caught, allowed, handler_excs)
         return
     if isinstance(node, TryStmt):
         body_caught = caught | _caught_excs(node)
-        _walk_calls(node.body, types, body_caught, allowed, calls, comment_allows)
+        _walk(node.body, c, body_caught, allowed, handler_excs)
         if node.else_body is not None:
             # the `else` clause is NOT covered by this try's except handlers
-            _walk_calls(node.else_body, types, caught, allowed, calls, comment_allows)
-        for handler in node.handlers:  # handler bodies run AFTER the exception
-            _walk_calls(handler, types, caught, allowed, calls, comment_allows)
+            _walk(node.else_body, c, caught, allowed, handler_excs)
+        for handler, type_expr in zip(node.handlers, node.types, strict=True):
+            _walk(handler, c, caught, allowed, _handler_caught(type_expr, c.exc_ancestors))
         if node.finally_body is not None:
-            _walk_calls(node.finally_body, types, caught, allowed, calls, comment_allows)
+            _walk(node.finally_body, c, caught, allowed, handler_excs)
         return
     if isinstance(node, WithStmt):
-        _walk_calls(node.body, types, caught, allowed | _allow_effects(node), calls, comment_allows)
+        _walk(node.body, c, caught, allowed | _allow_effects(node), handler_excs)
         return
     for child in _iter_children(node):
-        _walk_calls(child, types, caught, allowed, calls, comment_allows)
+        _walk(child, c, caught, allowed, handler_excs)
 
 
 def _ancestors_map(effect_fullnames: set[str]) -> dict[str, frozenset[str]]:
@@ -424,12 +503,15 @@ def analyze(
         declared = _declared_effects(func, module, exc_ancestors)
         if declared:
             all_effects |= {ref.fullname for ref in declared}
+        calls, raises = _collect(func, types, _comment_allows(module.path, module), exc_ancestors)
         functions[func.fullname] = FunctionModel(
             fullname=func.fullname,
             file=file,
             line=func.line,
             declared=declared,
-            calls=_collect_calls(func, types, _comment_allows(module.path, module)),
+            calls=calls,
+            raises=raises,
+            name=func.fullname.removeprefix(module.fullname + "."),  # drop module prefix
         )
     for effects in (external or {}).values():
         all_effects |= {ref.fullname for ref in effects}
