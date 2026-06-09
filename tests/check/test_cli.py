@@ -513,6 +513,50 @@ def test_cli_allow_context_manager_discharges(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+_BLIND_SPOTS = (
+    "from typing import Any, Callable\n"
+    "from efflux import Effects\n"
+    "def via_any(x: Any) -> Effects[int]:\n    return x.do_io()\n"
+    "def via_cb(cb: Callable[[], int]) -> Effects[int]:\n    return cb()\n"
+)
+
+
+def test_cli_report_unresolved_lists_blind_spots(tmp_path):
+    (tmp_path / "m.py").write_text(_BLIND_SPOTS)
+    proc = _cli("--report-unresolved", str(tmp_path / "m.py"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert 'unresolved call to `do_io()` in "via_any"' in proc.stdout
+    assert 'unresolved call to `cb()` in "via_cb"' in proc.stdout
+    assert "[unresolved-call]" in proc.stdout
+    assert "resolved 0/2 calls (2 unresolved" in proc.stdout
+
+
+def test_cli_coverage_footer_on_normal_check(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from typing import Any\n"
+        "from efflux import Effects\n"
+        "def f(x: Any) -> Effects[int]:\n    return x.do_io()\n"
+    )
+    proc = _cli(str(tmp_path / "m.py"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr  # x.do_io() assumed pure -> clean
+    assert "no effect violations found" in proc.stdout
+    assert "resolved 0/1 calls (1 unresolved → assumed pure)" in proc.stdout
+
+
+def test_cli_report_unresolved_json(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from typing import Any\n"
+        "from efflux import Effects\n"
+        "def f(x: Any) -> Effects[int]:\n    return x.do_io()\n"
+    )
+    proc = _cli("--report-unresolved", "--json", str(tmp_path / "m.py"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["total"] == 1 and data["resolved"] == 0
+    assert data["unresolved"][0]["hint"] == "do_io"
+    assert data["unresolved"][0]["function"] == "m.f"
+
+
 _STRICT_CASE1 = (
     "from efflux import Effects, Raises\n"
     "def a() -> Effects[None, Raises[ValueError]]:\n"

@@ -88,6 +88,42 @@ def test_callsite_carries_discharge_context():
     assert c.allowed == frozenset({"efflux.effects.WritesDB"})
 
 
+def test_callsite_unresolved_hint_defaults_none():
+    assert CallSite("m.g", 3).unresolved_hint is None
+    assert CallSite(None, 3, unresolved_hint="do_io").unresolved_hint == "do_io"
+
+
+def test_unresolved_call_format_with_hint():
+    from efflux.check.model import UnresolvedCall
+
+    m = FunctionModel(fullname="m.f", file="m.py", line=1, declared=None)
+    u = UnresolvedCall(function=m, call=CallSite(None, 5, unresolved_hint="do_io"))
+    assert u.format() == (
+        'm.py:5: note: unresolved call to `do_io()` in "f" '
+        "— effects assumed pure  [unresolved-call]"
+    )
+
+
+def test_unresolved_call_format_without_hint():
+    from efflux.check.model import UnresolvedCall
+
+    m = FunctionModel(fullname="m.f", file="m.py", line=1, declared=None)
+    u = UnresolvedCall(function=m, call=CallSite(None, 5))
+    assert u.format() == (
+        'm.py:5: note: unresolved call in "f" — effects assumed pure  [unresolved-call]'
+    )
+
+
+def test_unresolved_call_format_falls_back_to_bare_callee():
+    from efflux.check.model import UnresolvedCall
+
+    m = FunctionModel(fullname="m.f", file="m.py", line=1, declared=None)
+    u = UnresolvedCall(function=m, call=CallSite("cb", 4))  # a callback: callee is the bare name
+    assert u.format() == (
+        'm.py:4: note: unresolved call to `cb()` in "f" — effects assumed pure  [unresolved-call]'
+    )
+
+
 def test_raise_site_defaults():
     from efflux.check.model import RaiseSite
 

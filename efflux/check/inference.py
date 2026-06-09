@@ -9,6 +9,7 @@ from efflux.check.model import (
     EffectRef,
     FunctionModel,
     RaiseSite,
+    UnresolvedCall,
     UnusedDeclaration,
 )
 
@@ -165,6 +166,38 @@ def check_unused(
             ):
                 unused.append(UnusedDeclaration(function=model, effect=declared))
     return unused
+
+
+def _is_unresolved(call: CallSite, functions: dict[str, FunctionModel]) -> bool:
+    """A blind-spot call: the callee couldn't be resolved at all, or it's a bare
+    (unqualified) name that isn't a known in-project function — i.e. a callback or a
+    local holding a callable. Qualified callees (`m.g`, `requests.get`) count as
+    resolved even when their effects are unknown, to avoid flooding the report."""
+    if call.callee is None:
+        return True
+    return "." not in call.callee and call.callee not in functions
+
+
+def unresolved_calls(functions: dict[str, FunctionModel]) -> list[UnresolvedCall]:
+    """Every call whose callee could not be resolved (its effects are assumed pure) —
+    the blind spot surfaced by --report-unresolved."""
+    return [
+        UnresolvedCall(function=model, call=call)
+        for model in functions.values()
+        for call in model.calls
+        if _is_unresolved(call, functions)
+    ]
+
+
+def call_coverage(functions: dict[str, FunctionModel]) -> tuple[int, int]:
+    """(resolved, total) call sites — how much of the call graph efflux can see."""
+    total = resolved = 0
+    for model in functions.values():
+        for call in model.calls:
+            total += 1
+            if not _is_unresolved(call, functions):
+                resolved += 1
+    return resolved, total
 
 
 def _forbidden(

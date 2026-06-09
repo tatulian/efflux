@@ -8,12 +8,15 @@ class CallSite:
     """A call inside a function body. `callee` is the resolved callee fullname
     (or None if unresolved). `caught` is the set of exception fullnames caught by
     a surrounding try/except; `allowed` is the set of effect fullnames discharged
-    by a surrounding efflux.allow(...) or `# efflux: allow` comment."""
+    by a surrounding efflux.allow(...) or `# efflux: allow` comment. `unresolved_hint`
+    is the call's member/name (e.g. ``do_io``) when the callee couldn't be resolved,
+    for the --report-unresolved listing."""
 
     callee: str | None
     line: int
     caught: frozenset[str] = field(default_factory=frozenset)
     allowed: frozenset[str] = field(default_factory=frozenset)
+    unresolved_hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,4 +127,23 @@ class UnusedDeclaration:
             f"{self.function.file}:{self.function.line}: warning: "
             f'"{self.function.display_name}" declares unused effect "{self.effect.short}"'
             f"  [unused-effect]"
+        )
+
+
+@dataclass(frozen=True)
+class UnresolvedCall:
+    """A call whose callee efflux could not resolve (dynamic dispatch, a call on
+    `Any`, a callback parameter, ...). Its effects are assumed pure — a blind spot
+    surfaced by --report-unresolved. Informational (`note`), never an error."""
+
+    function: FunctionModel
+    call: CallSite
+
+    def format(self) -> str:
+        hint = self.call.unresolved_hint or self.call.callee  # member name, or the bare callee
+        what = f" to `{hint}()`" if hint else ""
+        return (
+            f"{self.function.file}:{self.call.line}: note: "
+            f'unresolved call{what} in "{self.function.display_name}" '
+            f"— effects assumed pure  [unresolved-call]"
         )

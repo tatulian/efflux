@@ -307,6 +307,38 @@ efflux is two independent layers that share one effect vocabulary:
 Use the first layer alone as *type-checked documentation*, or add the checker when you want
 propagation enforced.
 
+## Limitations
+
+efflux is a **gradual, optimistic** checker: anything it can't resolve, it assumes is pure.
+That keeps noise low, but it means efflux is a safety net, not a proof — it can miss effects.
+There are two kinds of blind spot, and efflux is upfront about both.
+
+**Unresolved calls** — a call through `Any`, a callback parameter, or dynamic dispatch can't
+be followed, so its effects are assumed pure. Every run prints a coverage line so you always
+know how much of the call graph efflux could see, and `--report-unresolved` lists the gaps:
+
+```bash
+efflux mypkg
+# ...
+# efflux: resolved 142/150 calls (8 unresolved → assumed pure)
+
+efflux --report-unresolved mypkg
+# api.py:21: note: unresolved call to `handler()` in "dispatch" — effects assumed pure  [unresolved-call]
+```
+
+The more typed your code, the higher the coverage.
+
+**Constructs not modeled as calls** — efflux *does* follow context managers
+(`with cm:` → `__enter__`/`__exit__`, so a transaction's `begin`/`commit` is seen) and
+property-getter reads (a lazy-loading `obj.value`). Still invisible:
+
+- **operators / subscripts** — `d[key]` (`__getitem__`), `a + b` (`__add__`);
+- **implicit exceptions** — `d[k]` raising `KeyError`; only **explicit** `raise` is modeled
+  (under `--strict`).
+
+For these, declare the effect on the boundary you control — the function's signature — and
+use `--report-unresolved` to see where efflux is guessing.
+
 ## Built for AI-assisted development
 
 Effect annotations are **machine-readable contracts**, which pays off twice when AI coding

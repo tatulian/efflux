@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from mypy import build
 from mypy.find_sources import create_source_list
 from mypy.nodes import (
+    AssignmentStmt,
     CallExpr,
     ClassDef,
     Decorator,
@@ -241,15 +242,16 @@ def _iter_children(node: Node) -> Iterator[Node]:
                             yield sub
 
 
-def _resolve_member_callee(member: MemberExpr, types: dict[Expression, Type]) -> str | None:
-    """Resolve a method call `recv.name(...)` to the method's fullname using the
-    receiver's type. Returns None if the receiver type or method can't be found."""
-    recv_type = types.get(member.expr)
-    if recv_type is None and isinstance(member.expr, RefExpr) and member.expr.node is not None:
-        recv_type = getattr(member.expr.node, "type", None)
+def _resolve_method_on(recv: Expression, name: str, types: dict[Expression, Type]) -> str | None:
+    """Resolve method `name` on the receiver expression's type to its fullname. Used
+    for `recv.method(...)` and for context-manager `__enter__`/`__exit__` dunders.
+    Returns None if the receiver type or the method can't be found."""
+    recv_type = types.get(recv)
+    if recv_type is None and isinstance(recv, RefExpr) and recv.node is not None:
+        recv_type = getattr(recv.node, "type", None)
     if not isinstance(recv_type, Instance):
         return None
-    sym = recv_type.type.get(member.name)
+    sym = recv_type.type.get(name)
     if sym is None:
         return None
     node = sym.node
@@ -257,6 +259,26 @@ def _resolve_member_callee(member: MemberExpr, types: dict[Expression, Type]) ->
         node = node.func
     if isinstance(node, FuncDef):
         return node.fullname
+    return None
+
+
+def _resolve_member_callee(member: MemberExpr, types: dict[Expression, Type]) -> str | None:
+    """Resolve a method call `recv.name(...)` to the method's fullname."""
+    return _resolve_method_on(member.expr, member.name, types)
+
+
+def _resolve_property_getter(member: MemberExpr, types: dict[Expression, Type]) -> str | None:
+    """If `recv.name` reads a property, return the getter's fullname (so its effects
+    are attributed to the access). Plain attributes / methods return None."""
+    recv_type = types.get(member.expr)
+    if recv_type is None and isinstance(member.expr, RefExpr) and member.expr.node is not None:
+        recv_type = getattr(member.expr.node, "type", None)
+    if not isinstance(recv_type, Instance):
+        return None
+    sym = recv_type.type.get(member.name)
+    node = sym.node if sym is not None else None
+    if isinstance(node, Decorator) and node.func.is_property:
+        return node.func.fullname
     return None
 
 
@@ -268,6 +290,13 @@ def _callee_fullname(callee: Expression, types: dict[Expression, Type]) -> str |
     if isinstance(callee, MemberExpr):
         return _resolve_member_callee(callee, types)
     return None
+
+
+def _callee_hint(callee: Expression) -> str | None:
+    """The member/name of an *unresolved* callee (e.g. ``do_io`` for ``x.do_io()``),
+    for the --report-unresolved listing. None when the callee has no simple name."""
+    name = getattr(callee, "name", None)
+    return name if isinstance(name, str) else None
 
 
 def _caught_excs(stmt: TryStmt) -> frozenset[str]:
@@ -436,9 +465,9 @@ def _walk(
         return
     if isinstance(node, CallExpr):
         line_allowed = allowed | c.comment_allows.get(node.line, frozenset())
-        c.calls.append(
-            CallSite(_callee_fullname(node.callee, c.types), node.line, caught, line_allowed)
-        )
+        fullname = _callee_fullname(node.callee, c.types)
+        hint = None if fullname is not None else _callee_hint(node.callee)
+        c.calls.append(CallSite(fullname, node.line, caught, line_allowed, hint))
         for child in _iter_children(node):
             _walk(child, c, caught, allowed, handler_excs)
         return
@@ -454,7 +483,31 @@ def _walk(
             _walk(node.finally_body, c, caught, allowed, handler_excs)
         return
     if isinstance(node, WithStmt):
+        # model the context manager's enter/exit (effects often live in their dunders:
+        # a transaction's begin/commit, a lock acquire/release)
+        enter, leave = ("__aenter__", "__aexit__") if node.is_async else ("__enter__", "__exit__")
+        for cm in node.expr:
+            for dunder in (enter, leave):
+                fullname = _resolve_method_on(cm, dunder, c.types)
+                if fullname is not None:
+                    c.calls.append(CallSite(fullname, node.line, caught, allowed))
         _walk(node.body, c, caught, allowed | _allow_effects(node), handler_excs)
+        return
+    if isinstance(node, AssignmentStmt):
+        _walk(node.rvalue, c, caught, allowed, handler_excs)  # rvalue read: properties modeled
+        for lvalue in node.lvalues:
+            # the outermost member of a target is a write (a property setter, not a
+            # getter read) — descend into its receiver but don't model it as a getter
+            target = lvalue.expr if isinstance(lvalue, MemberExpr) else lvalue
+            _walk(target, c, caught, allowed, handler_excs)
+        return
+    if isinstance(node, MemberExpr):
+        getter = _resolve_property_getter(node, c.types)
+        if getter is not None:  # reading a property invokes its getter (effects and all)
+            line_allowed = allowed | c.comment_allows.get(node.line, frozenset())
+            c.calls.append(CallSite(getter, node.line, caught, line_allowed))
+        for child in _iter_children(node):
+            _walk(child, c, caught, allowed, handler_excs)
         return
     for child in _iter_children(node):
         _walk(child, c, caught, allowed, handler_excs)

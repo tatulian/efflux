@@ -16,7 +16,14 @@ from efflux.check.baseline import filter_diagnostics, load_keys, write_baseline
 from efflux.check.default_externals import DEFAULT_EXTERNAL_MAP
 from efflux.check.engine import analyze
 from efflux.check.external_map import load_boundaries, load_external_map
-from efflux.check.inference import check, check_boundaries, check_unused, infer
+from efflux.check.inference import (
+    call_coverage,
+    check,
+    check_boundaries,
+    check_unused,
+    infer,
+    unresolved_calls,
+)
 from efflux.check.model import EffectRef, FunctionModel
 
 
@@ -60,7 +67,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="model explicit `raise` statements as effects and warn on unused declarations",
     )
+    parser.add_argument(
+        "--report-unresolved",
+        action="store_true",
+        help="list calls efflux could not resolve (their effects are assumed pure)",
+    )
     return parser
+
+
+def _coverage_line(resolved: int, total: int) -> str:
+    unresolved = total - resolved
+    if unresolved == 0:
+        return f"efflux: resolved {resolved}/{total} calls"
+    return f"efflux: resolved {resolved}/{total} calls ({unresolved} unresolved → assumed pure)"
 
 
 def _external_map(paths: list[str], use_builtins: bool) -> dict[str, frozenset[EffectRef]]:
@@ -101,6 +120,36 @@ def _run_report(
         for m in rows:
             effects = sorted(e.short for e in inferred[m.fullname])
             print(f"{m.file}:{m.line}: {m.fullname} -> {', '.join(effects) or '(pure)'}")
+    return 0
+
+
+def _run_unresolved(functions: dict[str, FunctionModel], *, as_json: bool) -> int:
+    unresolved = sorted(unresolved_calls(functions), key=lambda u: (u.function.file, u.call.line))
+    resolved, total = call_coverage(functions)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "resolved": resolved,
+                    "total": total,
+                    "unresolved": [
+                        {
+                            "function": u.function.fullname,
+                            "file": u.function.file,
+                            "line": u.call.line,
+                            "hint": u.call.unresolved_hint,
+                        }
+                        for u in unresolved
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+    for call in unresolved:
+        print(call.format())
+    if total:
+        print(_coverage_line(resolved, total))
     return 0
 
 
@@ -146,9 +195,11 @@ def _run_check(
     )
     unused_sorted = sorted(unused, key=lambda u: (u.function.file, u.function.line, u.effect.short))
     ok = not diag_sorted and not bound_sorted  # advisory warnings never flip the exit code
+    resolved, total = call_coverage(functions)
     if as_json:
         payload: dict[str, object] = {
             "ok": ok,
+            "coverage": {"resolved": resolved, "total": total},
             "violations": [
                 {
                     "function": d.function.fullname,
@@ -187,13 +238,15 @@ def _run_check(
         return 0 if ok else 1
     if ok and not unused_sorted:
         print("no effect violations found")
-        return 0
-    for diag in diag_sorted:
-        print(diag.format())
-    for violation in bound_sorted:
-        print(violation.format())
-    for declaration in unused_sorted:
-        print(declaration.format())
+    else:
+        for diag in diag_sorted:
+            print(diag.format())
+        for violation in bound_sorted:
+            print(violation.format())
+        for declaration in unused_sorted:
+            print(declaration.format())
+    if total:
+        print(_coverage_line(resolved, total))
     return 0 if ok else 1
 
 
@@ -252,6 +305,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.update and not args.baseline:
         print("efflux: --update requires --baseline FILE", file=sys.stderr)
         return 2
+
+    if args.report_unresolved:
+        return _run_unresolved(functions, as_json=args.json)
 
     if args.report:
         return _run_report(

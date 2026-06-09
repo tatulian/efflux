@@ -490,6 +490,53 @@ def test_check_without_include_raises_ignores_raises():
     assert check(_fns(c), ancestors={}, exc_ancestors={}, external={}) == []
 
 
+def test_unresolved_calls_lists_callee_none_sites():
+    from efflux.check.inference import unresolved_calls
+
+    f = FunctionModel(
+        "m.f",
+        "m.py",
+        1,
+        declared=None,
+        calls=[CallSite("m.g", 2), CallSite(None, 3, unresolved_hint="do_io")],
+    )
+    g = FunctionModel("m.g", "m.py", 5, declared=None, calls=[CallSite(None, 6)])
+    out = unresolved_calls(_fns(f, g))
+    assert {(u.function.fullname, u.call.line) for u in out} == {("m.f", 3), ("m.g", 6)}
+
+
+def test_call_coverage_counts_resolved_vs_total():
+    from efflux.check.inference import call_coverage
+
+    # m.g (qualified) and requests.get (qualified external) resolve; None does not.
+    f = FunctionModel(
+        "m.f",
+        "m.py",
+        1,
+        declared=None,
+        calls=[CallSite("m.g", 2), CallSite(None, 3), CallSite("requests.get", 4)],
+    )
+    assert call_coverage(_fns(f)) == (2, 3)
+
+
+def test_unresolved_calls_flags_bare_callback_not_nested_function():
+    from efflux.check.inference import unresolved_calls
+
+    # "inner" is a bare-keyed nested function -> resolved; "cb" is a callback -> not.
+    inner = FunctionModel("inner", "m.py", 2, declared=None)
+    outer = FunctionModel(
+        "m.outer", "m.py", 1, declared=None, calls=[CallSite("inner", 3), CallSite("cb", 4)]
+    )
+    out = unresolved_calls(_fns(inner, outer))
+    assert [(u.function.fullname, u.call.callee) for u in out] == [("m.outer", "cb")]
+
+
+def test_call_coverage_no_calls_is_zero_zero():
+    from efflux.check.inference import call_coverage
+
+    assert call_coverage(_fns(FunctionModel("m.f", "m.py", 1, declared=None))) == (0, 0)
+
+
 def test_check_unused_flags_dead_raises_but_not_the_justified_one():
     from efflux.check.inference import check_unused
     from efflux.check.model import RaiseSite

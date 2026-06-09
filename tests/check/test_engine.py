@@ -426,6 +426,120 @@ def test_analyze_strict_reports_escaping_raise(tmp_path):
     assert diags[0].function.fullname == "m.f"
 
 
+def test_walker_models_context_manager_dunders(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from efflux import Effects, WritesDB\n"
+        "class Tx:\n"
+        "    def __enter__(self) -> 'Tx':\n"
+        "        return self\n"
+        "    def __exit__(self, *a: object) -> None:\n"
+        "        return None\n"
+        "def use(tx: Tx) -> Effects[None]:\n"
+        "    with tx:\n"
+        "        pass\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    callees = [c.callee for c in functions["m.use"].calls]
+    assert "m.Tx.__enter__" in callees
+    assert "m.Tx.__exit__" in callees
+
+
+def test_walker_models_async_context_manager_dunders(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from efflux import Effects\n"
+        "class Tx:\n"
+        "    async def __aenter__(self) -> 'Tx':\n"
+        "        return self\n"
+        "    async def __aexit__(self, *a: object) -> None:\n"
+        "        return None\n"
+        "async def use(tx: Tx) -> Effects[None]:\n"
+        "    async with tx:\n"
+        "        pass\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    callees = [c.callee for c in functions["m.use"].calls]
+    assert "m.Tx.__aenter__" in callees
+    assert "m.Tx.__aexit__" in callees
+
+
+def test_walker_models_property_getter(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from efflux import Effects, ReadsDB\n"
+        "class W:\n"
+        "    @property\n"
+        "    def value(self) -> int:\n        return load()\n"
+        "def load() -> Effects[int, ReadsDB]: ...\n"
+        "def use(w: W) -> int:\n    return w.value\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    callees = [c.callee for c in functions["m.use"].calls]
+    assert "m.W.value" in callees  # property getter modeled as a call
+
+
+def test_walker_does_not_model_property_on_assignment_target(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "class W:\n"
+        "    @property\n"
+        "    def value(self) -> int:\n        return 1\n"
+        "    @value.setter\n"
+        "    def value(self, v: int) -> None: ...\n"
+        "def use(w: W) -> None:\n    w.value = 5\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    callees = [c.callee for c in functions["m.use"].calls]
+    assert "m.W.value" not in callees  # an assignment target is the setter, not a getter read
+
+
+def test_property_getter_effect_propagates_and_is_flagged(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from efflux import Effects, ReadsDB\n"
+        "def load() -> Effects[int, ReadsDB]:\n        return 1\n"
+        "class W:\n"
+        "    @property\n"
+        "    def value(self) -> int:\n        return load()\n"
+        "def use(w: W) -> Effects[int]:\n    return w.value\n"  # declares pure; getter reads DB
+    )
+    functions, ancestors, exc = analyze([str(tmp_path / "m.py")])
+    diags = check(functions, ancestors=ancestors, exc_ancestors=exc, external={})
+    assert any(d.function.fullname == "m.use" and d.effect.short == "ReadsDB" for d in diags)
+
+
+def test_context_manager_effect_propagates_and_is_flagged(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from efflux import Effects, WritesDB\n"
+        "def commit() -> Effects[None, WritesDB]:\n        return None\n"
+        "class Tx:\n"
+        "    def __enter__(self) -> 'Tx':\n        return self\n"
+        "    def __exit__(self, *a: object) -> None:\n        commit()\n"
+        "def use(tx: Tx) -> Effects[None]:\n"  # declares pure, but the cm commits on exit
+        "    with tx:\n        pass\n"
+    )
+    functions, ancestors, exc = analyze([str(tmp_path / "m.py")])
+    diags = check(functions, ancestors=ancestors, exc_ancestors=exc, external={})
+    assert any(d.function.fullname == "m.use" and d.effect.short == "WritesDB" for d in diags)
+
+
+def test_walker_records_unresolved_hint_for_member_on_any(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from typing import Any\ndef f(x: Any) -> int:\n    return x.do_io()\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    calls = functions["m.f"].calls
+    assert len(calls) == 1
+    assert calls[0].callee is None
+    assert calls[0].unresolved_hint == "do_io"
+
+
+def test_walker_records_bare_callback_callee(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "from typing import Callable\ndef f(cb: Callable[[], int]) -> int:\n    return cb()\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    calls = functions["m.f"].calls
+    # the engine records the bare name as-is; inference decides it is unresolved
+    assert calls and calls[0].callee == "cb"
+
+
 def test_collect_calls_else_body_not_caught(tmp_path):
     # An exception raised in a try...else clause is NOT routed through the try's
     # except handlers, so a call there must NOT inherit the try's caught set.
