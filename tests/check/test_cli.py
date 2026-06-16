@@ -41,6 +41,13 @@ def test_cli_help_exits_zero():
     assert "efflux" in proc.stdout
 
 
+def test_cli_version_flag():
+    proc = _cli("--version")
+    assert proc.returncode == 0
+    assert "efflux" in proc.stdout
+    assert any(ch.isdigit() for ch in proc.stdout)  # carries a version number
+
+
 def test_cli_unknown_flag_exits_two(tmp_path):
     proc = _cli("--nope", str(tmp_path))
     assert proc.returncode == 2
@@ -49,6 +56,17 @@ def test_cli_unknown_flag_exits_two(tmp_path):
 def test_cli_no_args_exits_two():
     proc = _cli()
     assert proc.returncode == 2
+
+
+def test_cli_warns_on_unknown_effect_name(tmp_path):
+    # A bogus effect name is advisory: warn, but don't fail the run.
+    proc = _run(
+        tmp_path,
+        ("m.py", "from efflux import Effects\ndef f() -> Effects[int, Bogus]:\n    return 1\n"),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[unknown-effect]" in proc.stdout
+    assert "Bogus" in proc.stdout
 
 
 def test_cli_builtin_external_map_flags_stdlib_effect(tmp_path):

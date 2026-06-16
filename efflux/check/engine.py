@@ -119,31 +119,47 @@ def _resolve_effect_name(unbound: UnboundType, module: MypyFile) -> str | None:
 
 
 def _resolve_exception(unbound: UnboundType, module: MypyFile) -> tuple[str, frozenset[str]] | None:
-    """Resolve an exception annotation to (fullname, ancestor fullnames). Builtins
-    via runtime MRO; user exceptions via mypy TypeInfo.mro. None if unresolvable."""
+    """Resolve an exception annotation to (fullname, ancestor fullnames). Walks
+    dotted references (``errors.MyError``, ``pkg.sub.Err``) through nested symbol
+    tables to a TypeInfo (user exceptions, MRO via ``TypeInfo.mro``); falls back to
+    builtins by name (``ValueError``, ``OSError`` — not in the module symbol table)
+    via runtime MRO. None if unresolvable."""
+    cur: object = module
+    parts = unbound.name.split(".")
+    for part in parts:
+        names = getattr(cur, "names", None)
+        if names is None:
+            cur = None
+            break
+        sym = names.get(part)
+        if sym is None or sym.node is None:
+            cur = None
+            break
+        cur = sym.node  # MypyFile for a submodule, TypeInfo for the class
+    if isinstance(cur, TypeInfo) and cur.has_base("builtins.BaseException"):
+        return cur.fullname, _exc_ancestors_of(cur)
     import builtins as _bi
 
-    name = unbound.name.rsplit(".", 1)[-1]
-    obj = getattr(_bi, name, None)
+    obj = getattr(_bi, parts[-1], None)
     if isinstance(obj, type) and issubclass(obj, BaseException):
         anc = frozenset(
             f"builtins.{c.__qualname__}" for c in obj.__mro__ if issubclass(c, BaseException)
         )
         return f"builtins.{obj.__qualname__}", anc
-    sym = module.names.get(name)
-    node = getattr(sym, "node", None) if sym is not None else None
-    if isinstance(node, TypeInfo) and node.has_base("builtins.BaseException"):
-        anc = frozenset(b.fullname for b in node.mro if b.fullname != "builtins.object")
-        return node.fullname, anc
     return None
 
 
 def _declared_effects(
-    func: FuncDef, module: MypyFile, exc_ancestors: dict[str, frozenset[str]]
+    func: FuncDef,
+    module: MypyFile,
+    exc_ancestors: dict[str, frozenset[str]],
+    unknown: list[str] | None = None,
 ) -> frozenset[EffectRef] | None:
     """Return declared effects as EffectRefs (Raises[E] carries the exception
     fullname), or None if the function has no Effects[...] return annotation.
-    Populates `exc_ancestors` for any Raises exception types encountered."""
+    Populates `exc_ancestors` for any Raises exception types encountered, and
+    appends to `unknown` any effect-position name that does not resolve to an
+    Effect subclass (a typo, a missing import, or a non-effect type)."""
     unanalyzed = func.unanalyzed_type
     ret = getattr(unanalyzed, "ret_type", None)
     if not isinstance(ret, UnboundType) or ret.name.split(".")[-1] != "Effects":
@@ -154,6 +170,8 @@ def _declared_effects(
             continue
         fullname = _resolve_effect_name(arg, module)
         if fullname is None:
+            if unknown is not None:
+                unknown.append(arg.name)
             continue
         exc: str | None = None
         if fullname == RAISES_FULLNAME and arg.args and isinstance(arg.args[0], UnboundType):
@@ -483,10 +501,13 @@ def _walk(
             _walk(node.finally_body, c, caught, allowed, handler_excs)
         return
     if isinstance(node, WithStmt):
-        # model the context manager's enter/exit (effects often live in their dunders:
-        # a transaction's begin/commit, a lock acquire/release)
+        # Two effect sources in a `with`: the header expression itself — the
+        # idiomatic `with open(...)` / `with db.connect()`, where the effect lives in
+        # the factory call — and the context manager's enter/exit dunders (a
+        # transaction's begin/commit, a lock acquire/release).
         enter, leave = ("__aenter__", "__aexit__") if node.is_async else ("__enter__", "__exit__")
         for cm in node.expr:
+            _walk(cm, c, caught, allowed, handler_excs)  # the header call (open(), connect(), ...)
             for dunder in (enter, leave):
                 fullname = _resolve_method_on(cm, dunder, c.types)
                 if fullname is not None:
@@ -553,7 +574,8 @@ def analyze(
     exc_ancestors: dict[str, frozenset[str]] = {}
     for file, func in _iter_funcdefs(trees):
         module = module_of[file]
-        declared = _declared_effects(func, module, exc_ancestors)
+        unknown: list[str] = []
+        declared = _declared_effects(func, module, exc_ancestors, unknown)
         if declared:
             all_effects |= {ref.fullname for ref in declared}
         calls, raises = _collect(func, types, _comment_allows(module.path, module), exc_ancestors)
@@ -565,6 +587,7 @@ def analyze(
             calls=calls,
             raises=raises,
             name=func.fullname.removeprefix(module.fullname + "."),  # drop module prefix
+            unknown_effects=unknown,
         )
     for effects in (external or {}).values():
         all_effects |= {ref.fullname for ref in effects}

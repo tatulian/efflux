@@ -53,14 +53,16 @@ DEFAULT_EXTERNAL_MAP: dict[str, frozenset[str]] = {
     "requests.api.head": _m(_NET),
     "requests.api.options": _m(_NET),
     "requests.api.request": _m(_NET),
-    "httpx.get": _m(_NET),
-    "httpx.post": _m(_NET),
-    "httpx.put": _m(_NET),
-    "httpx.patch": _m(_NET),
-    "httpx.delete": _m(_NET),
-    "httpx.head": _m(_NET),
-    "httpx.options": _m(_NET),
-    "httpx.request": _m(_NET),
+    # httpx's top-level verbs are defined in httpx._api (mypy resolves to the
+    # definition site, not the httpx.* re-export).
+    "httpx._api.get": _m(_NET),
+    "httpx._api.post": _m(_NET),
+    "httpx._api.put": _m(_NET),
+    "httpx._api.patch": _m(_NET),
+    "httpx._api.delete": _m(_NET),
+    "httpx._api.head": _m(_NET),
+    "httpx._api.options": _m(_NET),
+    "httpx._api.request": _m(_NET),
     # logging
     "logging.debug": _m(_LOGS),
     "logging.info": _m(_LOGS),
@@ -196,13 +198,15 @@ DEFAULT_EXTERNAL_MAP: dict[str, frozenset[str]] = {
     "threading.Condition.wait": _m(_BLOCKS),
     "queue.Queue.get": _m(_BLOCKS),
     "queue.Queue.put": _m(_BLOCKS),
-    # third-party data stores (best-effort; fullnames may shift between versions)
-    "sqlalchemy.create_engine": _m(_DATABASE),
-    "sqlalchemy.engine.Engine.connect": _m(_DATABASE),
-    "sqlalchemy.engine.Connection.execute": _m(_DATABASE),
-    "sqlalchemy.orm.Session.execute": _m(_DATABASE),
-    "sqlalchemy.orm.Session.commit": _m(_DATABASE),
-    "sqlalchemy.orm.Session.query": _m(_DATABASE),
+    # third-party data stores. Best-effort: these only fire when the library ships
+    # type information (py.typed / stubs) so mypy can resolve the callee, and the
+    # fullname is the definition site (verified against SQLAlchemy 2.x).
+    "sqlalchemy.engine.create.create_engine": _m(_DATABASE),
+    "sqlalchemy.engine.base.Engine.connect": _m(_DATABASE),
+    "sqlalchemy.engine.base.Connection.execute": _m(_DATABASE),
+    "sqlalchemy.orm.session.Session.execute": _m(_DATABASE),
+    "sqlalchemy.orm.session.Session.commit": _m(_DATABASE),
+    "sqlalchemy.orm.session.Session.query": _m(_DATABASE),
     "psycopg.connect": _m(_DATABASE),
     "psycopg.Connection.execute": _m(_DATABASE),
     "psycopg.Cursor.execute": _m(_DATABASE),

@@ -46,3 +46,23 @@ def test_effects_of_resolves_string_annotations(tmp_path):
     spec.loader.exec_module(mod)
 
     assert effects_of(mod.g) == (WritesDB,)
+
+
+def test_effects_of_degrades_when_return_type_is_type_checking_only(tmp_path):
+    # Best-practice pattern: `from __future__ import annotations` + a TYPE_CHECKING
+    # import for the return type. get_type_hints() raises NameError on the unresolved
+    # name; effects_of must still recover the real (imported) effects, not crash.
+    p = tmp_path / "tc_sample.py"
+    p.write_text(
+        "from __future__ import annotations\n"
+        "from typing import TYPE_CHECKING\n"
+        "from efflux import Effects, WritesDB, Logs\n"
+        "if TYPE_CHECKING:\n"
+        "    from nonexistent_pkg import Receipt\n"
+        "def charge() -> Effects[Receipt, WritesDB, Logs]: ...\n"
+    )
+    spec = importlib.util.spec_from_file_location("tc_sample", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert effects_of(mod.charge) == (WritesDB, Logs)

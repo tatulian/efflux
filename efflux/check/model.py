@@ -63,6 +63,8 @@ class FunctionModel:
     calls: list[CallSite] = field(default_factory=list)
     raises: list[RaiseSite] = field(default_factory=list)
     name: str = ""  # module-stripped display name (e.g. "Repo.save"); set by the engine
+    # effect-position names in Effects[...] that don't resolve to an Effect subclass:
+    unknown_effects: list[str] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:
@@ -127,6 +129,23 @@ class UnusedDeclaration:
             f"{self.function.file}:{self.function.line}: warning: "
             f'"{self.function.display_name}" declares unused effect "{self.effect.short}"'
             f"  [unused-effect]"
+        )
+
+
+@dataclass(frozen=True)
+class UnknownEffect:
+    """`function` lists `name` in its `Effects[...]` but it does not resolve to an
+    `Effect` subclass (typo, missing import, or a non-effect type). The checker would
+    otherwise silently ignore it. Advisory only (`warning`); reported at the def line."""
+
+    function: FunctionModel
+    name: str
+
+    def format(self) -> str:
+        return (
+            f"{self.function.file}:{self.function.line}: warning: "
+            f'"{self.function.display_name}" declares unknown effect "{self.name}" '
+            f"(not an efflux.Effect — typo or missing import?)  [unknown-effect]"
         )
 
 

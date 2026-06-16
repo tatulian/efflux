@@ -6,7 +6,8 @@ def test_map_includes_stdlib_and_http_libs():
     assert DEFAULT_EXTERNAL_MAP["time.sleep"] == frozenset({"efflux.effects.Blocks"})
     assert DEFAULT_EXTERNAL_MAP["os.getenv"] == frozenset({"efflux.effects.ReadsEnv"})
     assert DEFAULT_EXTERNAL_MAP["requests.api.get"] == frozenset({"efflux.effects.Network"})
-    assert DEFAULT_EXTERNAL_MAP["httpx.get"] == frozenset({"efflux.effects.Network"})
+    # httpx's verbs are defined in httpx._api (verified against the real package)
+    assert DEFAULT_EXTERNAL_MAP["httpx._api.get"] == frozenset({"efflux.effects.Network"})
 
 
 def test_map_values_are_frozensets_of_effect_fullnames():
@@ -35,7 +36,7 @@ def test_map_includes_processes_and_expanded_stdlib():
 def test_map_includes_third_party_db_and_network():
     db = frozenset({"efflux.effects.Database"})
     net = frozenset({"efflux.effects.Network"})
-    assert DEFAULT_EXTERNAL_MAP["sqlalchemy.orm.Session.execute"] == db
+    assert DEFAULT_EXTERNAL_MAP["sqlalchemy.orm.session.Session.execute"] == db
     assert DEFAULT_EXTERNAL_MAP["redis.Redis.get"] == db
     assert DEFAULT_EXTERNAL_MAP["pymongo.collection.Collection.find"] == db
     assert DEFAULT_EXTERNAL_MAP["aiohttp.ClientSession.get"] == net

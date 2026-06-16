@@ -20,11 +20,21 @@ from efflux.check.inference import (
     call_coverage,
     check,
     check_boundaries,
+    check_unknown_effects,
     check_unused,
     infer,
     unresolved_calls,
 )
 from efflux.check.model import EffectRef, FunctionModel
+
+
+def _package_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("efflux")
+    except PackageNotFoundError:  # pragma: no cover - running from a source tree
+        return "unknown"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -33,6 +43,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Check and report side effects declared with Effects[...].",
     )
     parser.add_argument("paths", nargs="+", help="packages, modules, or files to analyze")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_package_version()}")
     parser.add_argument(
         "--report",
         action="store_true",
@@ -186,6 +197,7 @@ def _run_check(
         if strict
         else []
     )
+    unknown = check_unknown_effects(functions)
     diag_sorted = sorted(
         diagnostics, key=lambda d: (d.function.file, d.function.line, d.effect.short)
     )
@@ -194,6 +206,7 @@ def _run_check(
         key=lambda b: (b.function.file, b.function.line, b.boundary, b.effect.short),
     )
     unused_sorted = sorted(unused, key=lambda u: (u.function.file, u.function.line, u.effect.short))
+    unknown_sorted = sorted(unknown, key=lambda u: (u.function.file, u.function.line, u.name))
     ok = not diag_sorted and not bound_sorted  # advisory warnings never flip the exit code
     resolved, total = call_coverage(functions)
     if as_json:
@@ -223,6 +236,15 @@ def _run_check(
                 }
                 for b in bound_sorted
             ],
+            "unknown": [
+                {
+                    "function": u.function.fullname,
+                    "file": u.function.file,
+                    "line": u.function.line,
+                    "name": u.name,
+                }
+                for u in unknown_sorted
+            ],
         }
         if strict:
             payload["unused"] = [
@@ -236,7 +258,7 @@ def _run_check(
             ]
         print(json.dumps(payload, indent=2))
         return 0 if ok else 1
-    if ok and not unused_sorted:
+    if ok and not unused_sorted and not unknown_sorted:
         print("no effect violations found")
     else:
         for diag in diag_sorted:
@@ -245,6 +267,8 @@ def _run_check(
             print(violation.format())
         for declaration in unused_sorted:
             print(declaration.format())
+        for unk in unknown_sorted:
+            print(unk.format())
     if total:
         print(_coverage_line(resolved, total))
     return 0 if ok else 1
@@ -257,12 +281,15 @@ def _run_fix(
     exc_ancestors: dict[str, frozenset[str]],
     *,
     aggressive: bool,
+    strict: bool,
 ) -> int:
     from pathlib import Path
 
     from efflux.check.fixer import fix_file, plan_fixes
 
-    by_file = plan_fixes(functions, ancestors, exc_ancestors, external, aggressive=aggressive)
+    by_file = plan_fixes(
+        functions, ancestors, exc_ancestors, external, aggressive=aggressive, include_raises=strict
+    )
     changed = 0
     skipped: list[str] = []
     for file, fixes in sorted(by_file.items()):
@@ -300,7 +327,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.fix:
-        return _run_fix(functions, external, ancestors, exc_ancestors, aggressive=args.unsafe)
+        return _run_fix(
+            functions,
+            external,
+            ancestors,
+            exc_ancestors,
+            aggressive=args.unsafe,
+            strict=args.strict,
+        )
 
     if args.update and not args.baseline:
         print("efflux: --update requires --baseline FILE", file=sys.stderr)

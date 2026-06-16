@@ -8,3 +8,6 @@ dist/
 .ruff_cache/
 .venv/
 .idea/
+.coverage
+.coverage.*
+htmlcov/

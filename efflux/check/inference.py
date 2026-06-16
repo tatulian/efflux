@@ -9,6 +9,7 @@ from efflux.check.model import (
     EffectRef,
     FunctionModel,
     RaiseSite,
+    UnknownEffect,
     UnresolvedCall,
     UnusedDeclaration,
 )
@@ -166,6 +167,17 @@ def check_unused(
             ):
                 unused.append(UnusedDeclaration(function=model, effect=declared))
     return unused
+
+
+def check_unknown_effects(functions: dict[str, FunctionModel]) -> list[UnknownEffect]:
+    """Report effect-position names in `Effects[...]` that don't resolve to an Effect
+    subclass (typo / missing import / non-effect type). Advisory; the checker would
+    otherwise silently ignore them."""
+    return [
+        UnknownEffect(function=model, name=name)
+        for model in functions.values()
+        for name in model.unknown_effects
+    ]
 
 
 def _is_unresolved(call: CallSite, functions: dict[str, FunctionModel]) -> bool:

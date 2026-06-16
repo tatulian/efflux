@@ -78,6 +78,40 @@ def test_reads_raises_with_exception(tmp_path):
     )
 
 
+def test_dotted_raises_exception_resolves(tmp_path):
+    # A dotted exception reference (Raises[errors.MyError]) must resolve to the
+    # exception fullname — not silently degrade to bare Raises (which covers any).
+    (tmp_path / "errors.py").write_text("class MyError(Exception): ...\n")
+    (tmp_path / "m.py").write_text(
+        "import errors\n"
+        "from efflux import Effects, Raises\n"
+        "def f() -> Effects[int, Raises[errors.MyError]]:\n    return 1\n"
+    )
+    trees = _build_trees([str(tmp_path / "m.py"), str(tmp_path / "errors.py")])
+    funcs = {fd.fullname: fd for _file, fd in _iter_funcdefs(trees)}
+    exc_ancestors: dict[str, frozenset[str]] = {}
+    declared = _declared_effects(funcs["m.f"], trees["m"], exc_ancestors)
+    assert declared == frozenset({EffectRef("efflux.effects.Raises", "errors.MyError")})
+    assert "errors.MyError" in exc_ancestors  # MRO recorded for subsumption/discharge
+
+
+def test_unknown_effect_name_is_reported(tmp_path):
+    # A name in Effects[...] that doesn't resolve to an Effect subclass (typo,
+    # missing import, or a non-effect type) must be surfaced, not silently dropped.
+    from efflux.check.inference import check_unknown_effects
+
+    (tmp_path / "m.py").write_text(
+        "from efflux import Effects, WritesDB\n"
+        "def f() -> Effects[int, WritesDB, Bogus]:\n    return 1\n"
+    )
+    functions, _a, _e = analyze([str(tmp_path / "m.py")])
+    # the resolvable effect is still declared...
+    assert functions["m.f"].declared == frozenset({EffectRef("efflux.effects.WritesDB")})
+    # ...and the unresolvable name is reported as an advisory finding
+    unknown = check_unknown_effects(functions)
+    assert [(u.function.fullname, u.name) for u in unknown] == [("m.f", "Bogus")]
+
+
 def test_fully_unannotated_function_returns_none(tmp_path):
     (tmp_path / "m.py").write_text("def g(a, b):\n    return 1\n")
     trees = _build_trees([str(tmp_path / "m.py")])
@@ -513,6 +547,24 @@ def test_context_manager_effect_propagates_and_is_flagged(tmp_path):
         "    def __exit__(self, *a: object) -> None:\n        commit()\n"
         "def use(tx: Tx) -> Effects[None]:\n"  # declares pure, but the cm commits on exit
         "    with tx:\n        pass\n"
+    )
+    functions, ancestors, exc = analyze([str(tmp_path / "m.py")])
+    diags = check(functions, ancestors=ancestors, exc_ancestors=exc, external={})
+    assert any(d.function.fullname == "m.use" and d.effect.short == "WritesDB" for d in diags)
+
+
+def test_call_in_with_header_effect_propagates_and_is_flagged(tmp_path):
+    # The effectful factory call in a `with` *header* (the idiomatic `with open(...)`)
+    # must be seen — not only the context manager's __enter__/__exit__ dunders. Here
+    # the cm's dunders are pure; the only WritesDB source is the begin() call itself.
+    (tmp_path / "m.py").write_text(
+        "from efflux import Effects, WritesDB\n"
+        "class Tx:\n"
+        "    def __enter__(self) -> 'Tx':\n        return self\n"
+        "    def __exit__(self, *a: object) -> None:\n        return None\n"
+        "def begin() -> Effects[Tx, WritesDB]:\n        return Tx()\n"
+        "def use() -> Effects[None]:\n"  # declares pure, but opens an effectful cm
+        "    with begin() as tx:\n        pass\n"
     )
     functions, ancestors, exc = analyze([str(tmp_path / "m.py")])
     diags = check(functions, ancestors=ancestors, exc_ancestors=exc, external={})

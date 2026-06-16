@@ -142,7 +142,11 @@ calls — filesystem (`open`, `pathlib`, `shutil`, `tempfile`, `os.path`),
 `requests`, `httpx`, `aiohttp`), `os.getenv`, `logging.*`, `time.*`/`datetime`,
 `random`/`uuid`/`secrets`, `asyncio.sleep`, and databases (`sqlalchemy`,
 `psycopg`, `redis`, `pymongo`) — applied by default; your entries override it
-per callee, and `--no-builtins` turns it off. Report every function's inferred
+per callee, and `--no-builtins` turns it off. Third-party entries fire only when
+the library ships type information (a `py.typed` marker or stubs) so mypy can
+resolve the call to its definition; calls on untyped objects — including the
+method-heavy `redis`/`pymongo` clients without stubs — fall through to your
+config or show up under `--report-unresolved`. Report every function's inferred
 effects instead of checking:
 
 ```bash
@@ -424,6 +428,11 @@ enforcement.
 
 **What's the runtime cost?** Effectively none. `Effects[...]` is an `Annotated` type; at
 runtime it's metadata, and `import efflux` does not import mypy.
+
+**Does the checker run my code?** No — `efflux <path>` drives mypy, which *parses* your code
+without executing it. The one exception: to read your effect classes' subclass hierarchy (for
+subsumption), it imports the modules that *define* `Effect` subclasses — not the rest of your
+code. Keep effect-definition modules import-safe (they normally are: just class declarations).
 
 **Is it all-or-nothing?** No — adoption is gradual. Only functions you annotate with
 `Effects[...]` are enforced; the rest are inferred and propagated silently.
